@@ -4584,6 +4584,15 @@ def _fund_screener_resolve_api_key() -> str:
     return _normalize(str(st.session_state.get("fund_screener_api_key", "")))
 
 
+def _fund_screener_masked_key_info(key: str) -> str:
+    """Safe key diagnostics for UI."""
+    if not key:
+        return "ไม่พบ key"
+    if len(key) <= 12:
+        return f"{key[:4]}... (len={len(key)})"
+    return f"{key[:8]}...{key[-4:]} (len={len(key)})"
+
+
 def _fund_screener_render_api_key_setup() -> None:
     """Show setup UI when no API key is configured."""
     st.warning("ยังไม่พบ Anthropic API key — ใส่ด้านล่าง หรือตั้งค่าก่อนรันแอป")
@@ -4827,8 +4836,21 @@ with st.sidebar:
     if st.session_state.active_topic == "Thai Fund Screener":
         st.divider()
         st.caption("Anthropic API")
-        if _fund_screener_resolve_api_key():
+        current_api_key = _fund_screener_resolve_api_key()
+        if current_api_key:
             st.success("API key พร้อมใช้งาน")
+            st.caption(f"Key: {_fund_screener_masked_key_info(current_api_key)}")
+            if st.button("ทดสอบ API key", key="fund_screener_test_key", use_container_width=True):
+                try:
+                    _client = anthropic.Anthropic(api_key=current_api_key)
+                    _ = _client.messages.create(
+                        model=FUND_SCREENER_MODEL,
+                        max_tokens=16,
+                        messages=[{"role": "user", "content": "ping"}],
+                    )
+                    st.success("ทดสอบสำเร็จ: API key ใช้งานได้")
+                except Exception as e:
+                    st.error(f"ทดสอบไม่ผ่าน: {e}")
             if st.button("ลบ key จาก session", key="fund_screener_clear_key"):
                 st.session_state.pop("fund_screener_api_key", None)
                 st.rerun()
