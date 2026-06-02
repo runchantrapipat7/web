@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -4560,17 +4561,27 @@ FUND_SCREENER_SYSTEM_PROMPT = """\
 
 def _fund_screener_resolve_api_key() -> str:
     """API key from env, Streamlit secrets, or session (sidebar / page form)."""
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    def _normalize(raw: str) -> str:
+        key = str(raw or "").strip().strip("'\"")
+        if not key:
+            return ""
+        # Handle accidental full command pastes like: setx ANTHROPIC_API_KEY sk-ant-...
+        sk_match = re.search(r"(sk-ant-[A-Za-z0-9_-]+)", key)
+        if sk_match:
+            return sk_match.group(1).strip().strip("'\"")
+        return key
+
+    key = _normalize(os.environ.get("ANTHROPIC_API_KEY", ""))
     if key:
         return key
     try:
         if "ANTHROPIC_API_KEY" in st.secrets:
-            key = str(st.secrets["ANTHROPIC_API_KEY"]).strip()
+            key = _normalize(str(st.secrets["ANTHROPIC_API_KEY"]))
             if key:
                 return key
     except Exception:
         pass
-    return str(st.session_state.get("fund_screener_api_key", "")).strip()
+    return _normalize(str(st.session_state.get("fund_screener_api_key", "")))
 
 
 def _fund_screener_render_api_key_setup() -> None:
@@ -4635,6 +4646,10 @@ def fund_screener_chat_page() -> None:
 
     api_key = _fund_screener_resolve_api_key()
     if not api_key:
+        _fund_screener_render_api_key_setup()
+        return
+    if not api_key.startswith("sk-ant-"):
+        st.error("รูปแบบ Anthropic API key ไม่ถูกต้อง (ต้องขึ้นต้นด้วย sk-ant-)")
         _fund_screener_render_api_key_setup()
         return
 
