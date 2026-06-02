@@ -4558,6 +4558,49 @@ FUND_SCREENER_SYSTEM_PROMPT = """\
 """
 
 
+def _fund_screener_resolve_api_key() -> str:
+    """API key from env, Streamlit secrets, or session (sidebar / page form)."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            key = str(st.secrets["ANTHROPIC_API_KEY"]).strip()
+            if key:
+                return key
+    except Exception:
+        pass
+    return str(st.session_state.get("fund_screener_api_key", "")).strip()
+
+
+def _fund_screener_render_api_key_setup() -> None:
+    """Show setup UI when no API key is configured."""
+    st.warning("ยังไม่พบ Anthropic API key — ใส่ด้านล่าง หรือตั้งค่าก่อนรันแอป")
+    with st.expander("ใส่ API key ในแอป (ใช้เฉพาะ session นี้)", expanded=True):
+        with st.form("fund_screener_api_form"):
+            entered = st.text_input(
+                "Anthropic API Key",
+                type="password",
+                placeholder="sk-ant-api03-...",
+                help="ได้จาก console.anthropic.com — เก็บเฉพาะในเบราว์เซอร์/session นี้",
+            )
+            if st.form_submit_button("บันทึกและเริ่มใช้งาน", type="primary"):
+                if entered.strip():
+                    st.session_state.fund_screener_api_key = entered.strip()
+                    st.rerun()
+                else:
+                    st.error("กรุณาใส่ API key")
+    st.markdown("**วิธีอื่น (แนะนำถ้ารันบ่อย)**")
+    st.code(
+        "# PowerShell (session ปัจจุบัน)\n"
+        '$env:ANTHROPIC_API_KEY="sk-ant-..."\n'
+        "streamlit run wwwwww.py\n\n"
+        "# หรือสร้างไฟล์ .streamlit/secrets.toml\n"
+        'ANTHROPIC_API_KEY = "sk-ant-..."',
+        language="powershell",
+    )
+
+
 def _fund_screener_extract_sources(content_blocks: list[dict]) -> list[tuple[str, str]]:
     """Return unique (title, url) pairs from web search result blocks."""
     seen: set[str] = set()
@@ -4590,10 +4633,9 @@ def fund_screener_chat_page() -> None:
         st.error("ยังไม่ได้ติดตั้ง `anthropic` — รัน `pip install anthropic` แล้วรีสตาร์ตแอป")
         return
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = _fund_screener_resolve_api_key()
     if not api_key:
-        st.warning("ยังไม่พบ `ANTHROPIC_API_KEY` ใน environment ของเครื่องที่รันแอป")
-        st.code("set ANTHROPIC_API_KEY=sk-ant-...   # Windows PowerShell/CMD", language="bash")
+        _fund_screener_render_api_key_setup()
         return
 
     history_key = "fund_screener_messages"
@@ -4766,6 +4808,22 @@ with st.sidebar:
                     type="primary" if is_active_page else "secondary",
                 ):
                     navigate(topic_name, page_name)
+
+    if st.session_state.active_topic == "Thai Fund Screener":
+        st.divider()
+        st.caption("Anthropic API")
+        if _fund_screener_resolve_api_key():
+            st.success("API key พร้อมใช้งาน")
+            if st.button("ลบ key จาก session", key="fund_screener_clear_key"):
+                st.session_state.pop("fund_screener_api_key", None)
+                st.rerun()
+        else:
+            with st.form("fund_screener_sidebar_api"):
+                sk = st.text_input("API Key", type="password", label_visibility="collapsed")
+                if st.form_submit_button("บันทึก key", use_container_width=True):
+                    if sk.strip():
+                        st.session_state.fund_screener_api_key = sk.strip()
+                        st.rerun()
 
     # Topic-specific quick stats (only meaningful for Gold right now)
     if st.session_state.active_topic == "Gold (XAU/USD)":
