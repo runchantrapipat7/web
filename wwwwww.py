@@ -29,6 +29,7 @@ Adding a new topic
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
@@ -56,6 +57,16 @@ except ImportError:
     _scipy_mvn = None  # type: ignore[assignment]
     _scipy_norm = None  # type: ignore[assignment]
     _SCIPY_OK = False
+
+try:
+    import refinitiv.data as rd
+    from refinitiv.data.content import pricing as _rd_pricing
+
+    _RD_OK = True
+except ImportError:
+    rd = None  # type: ignore[assignment]
+    _rd_pricing = None  # type: ignore[assignment]
+    _RD_OK = False
 
 
 st.set_page_config(
@@ -3750,76 +3761,359 @@ def fcn_hero() -> None:
         c4.metric("THOR baseline", "2.25%", "risk-free in presets")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _fcn_fetch_yahoo(raw_ticker: str) -> dict:
+def _fcn_lseg_app_key() -> Optional[str]:
     """
-    Fetch spot, ~30d realized vol, and dividend yield from Yahoo Finance.
+    LSEG / Refinitiv application key (never hard-code in source).
 
-    Designed for SET tickers — if the user types a bare symbol like 'CPALL',
-    we append '.BK' for the Yahoo lookup. If they already supplied a dotted
-    symbol (e.g. 'CPALL.BK' or 'AAPL' which has no dot but is a US stock),
-    we respect what they typed (US tickers without a dot just resolve directly).
-
-    Returns dict with keys: ok, spot, vol_pct, div_yield_pct, source_ticker, error.
-    Cached for 5 minutes to avoid hammering Yahoo on widget reruns.
-
-    NOTE: implied vol is not available on free Yahoo data — we use 30-day
-    realized vol from log returns as a proxy. The desk should override this
-    with a broker-quoted IV in the implied-vol field after fetch.
+    Resolution order:
+      1. LSEG_APP_KEY or REFINITIV_APP_KEY environment variable
+      2. st.secrets[lseg].app_key (or flat LSEG_APP_KEY in secrets.toml)
+      3. None → rd.open_session() uses refinitiv-data.config.json / Workspace
     """
-    if not _YF_OK:
-        return {"ok": False, "error": "yfinance is not installed in this environment."}
+    for env_name in ("LSEG_APP_KEY", "REFINITIV_APP_KEY", "RD_APP_KEY"):
+        val = os.environ.get(env_name, "").strip()
+        if val:
+            return val
+    try:
+        flat = st.secrets.get("LSEG_APP_KEY")
+        if flat:
+            return str(flat).strip()
+        lseg = st.secrets.get("lseg")
+        if isinstance(lseg, dict):
+            for k in ("app_key", "app-key", "api_key"):
+                if lseg.get(k):
+                    return str(lseg[k]).strip()
+    except Exception:
+        pass
+    return None
 
+
+def _fcn_lseg_open_session() -> None:
+    """Open Refinitiv session (desktop Workspace) with optional app key."""
+    if not _RD_OK or rd is None:
+        raise RuntimeError("refinitiv.data is not installed")
+    app_key = _fcn_lseg_app_key()
+    if app_key:
+        rd.open_session(app_key=app_key)
+    else:
+        rd.open_session()
+
+
+def _fcn_lseg_close_session() -> None:
+    if _RD_OK and rd is not None:
+        try:
+            rd.close_session()
+        except Exception:
+            pass
+
+
+def _fcn_ticker_to_ric(raw_ticker: str) -> tuple[str, Optional[str]]:
+    """
+    Map desk ticker input to a Refinitiv RIC (SET names use .BK).
+
+    Returns (ric, error). Bare SET tickers get `.BK` for LSEG RIC lookup.
+    """
     raw = (raw_ticker or "").strip().upper()
     if not raw:
-        return {"ok": False, "error": "Ticker is empty."}
+        return "", "Ticker is empty."
+    ric = raw if ("." in raw or raw.startswith("^")) else f"{raw}.BK"
+    return ric, None
 
-    # Heuristic: bare alpha-only ticker -> assume SET, append .BK.
-    # If the user already provided a dot (e.g. 'CPALL.BK', 'BRK-B', '^SET'),
-    # respect their input.
-    yahoo_sym = raw if ("." in raw or raw.startswith("^")) else f"{raw}.BK"
+
+def _fcn_lseg_history_window() -> tuple[str, str]:
+    """~1y of daily history ending today (calendar buffer for 252 sessions)."""
+    end_d = datetime.now().date()
+    start_d = end_d - timedelta(days=400)
+    return start_d.isoformat(), end_d.isoformat()
+
+
+def _fcn_lseg_closes_frame(df_prices: pd.DataFrame, rics: List[str]) -> pd.DataFrame:
+    """
+    Normalize rd.get_history() output to a Date-indexed frame of close prices
+    with one column per RIC.
+    """
+    if df_prices is None or df_prices.empty:
+        raise ValueError("No price history returned from LSEG.")
+
+    df = df_prices.copy()
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+
+    close_aliases = {
+        "TR.CLOSEPRICE",
+        "Close",
+        "CLOSE",
+        "close",
+        "TRDPRC_1",
+    }
+
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = df.columns.get_level_values(0)
+        level1 = df.columns.get_level_values(-1)
+        picked: Dict[str, pd.Series] = {}
+        for ric in rics:
+            if ric in level0:
+                sub = df[ric]
+                col = next(
+                    (c for c in sub.columns if str(c) in close_aliases or "CLOSE" in str(c).upper()),
+                    sub.columns[0],
+                )
+                picked[ric] = sub[col]
+            elif ric in level1:
+                col = next(
+                    (c for c in df.columns if c[-1] == ric or c[0] == ric),
+                    None,
+                )
+                if col is not None:
+                    picked[ric] = df[col]
+        if not picked:
+            raise ValueError(f"Could not parse multi-index history for {rics}.")
+        out = pd.DataFrame(picked)
+    else:
+        rename: Dict[str, str] = {}
+        for ric in rics:
+            if ric in df.columns:
+                rename[ric] = ric
+                continue
+            for c in df.columns:
+                cs = str(c)
+                if ric in cs or cs in close_aliases:
+                    rename[c] = ric
+                    break
+        if not rename:
+            numeric = df.select_dtypes(include=[np.number])
+            if numeric.shape[1] >= len(rics):
+                out = numeric.iloc[:, : len(rics)].copy()
+                out.columns = rics
+            else:
+                raise ValueError(f"Unexpected history columns: {list(df.columns)}")
+        else:
+            out = df[list(rename)].rename(columns=rename)
+
+    if not isinstance(out.index, pd.DatetimeIndex):
+        for cand in ("Date", "date", "DATE", "Level_0"):
+            if cand in out.columns:
+                out = out.set_index(cand)
+                break
+    out.index = pd.to_datetime(out.index)
+    out = out.sort_index().apply(pd.to_numeric, errors="coerce").dropna(how="all")
+    if out.empty or len(out) < 21:
+        raise ValueError(f"Insufficient closes after clean ({len(out)} rows).")
+    return out
+
+
+def _fcn_lseg_realized_vol_pct(closes: pd.Series, window: int = 30) -> float:
+    log_ret = np.log(closes / closes.shift(1)).dropna()
+    recent = log_ret.tail(window)
+    if len(recent) < 5:
+        raise ValueError("Not enough returns for realized vol.")
+    return float(recent.std() * np.sqrt(252) * 100.0)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fcn_fetch_lseg_correlation(raw_tickers: tuple[str, ...]) -> dict:
+    """
+    Pull ~1y daily closes from LSEG Workspace and return pairwise correlations
+    of log returns (for the FCN correlation matrix sliders).
+
+    Requires LSEG Workspace running locally. Cached 5 minutes.
+    """
+    if not _RD_OK:
+        return {"ok": False, "error": "refinitiv.data is not installed. pip install refinitiv-data"}
+
+    rics: List[str] = []
+    for raw in raw_tickers:
+        ric, err = _fcn_ticker_to_ric(raw)
+        if err:
+            return {"ok": False, "error": err}
+        rics.append(ric)
+
+    if len(rics) < 2:
+        return {"ok": False, "error": "Need at least two tickers for a correlation matrix."}
+
+    start, end = _fcn_lseg_history_window()
+    try:
+        _fcn_lseg_open_session()
+        df_prices = rd.get_history(
+            universe=rics,
+            fields=["TR.CLOSEPRICE"],
+            start=start,
+            end=end,
+            interval="daily",
+        )
+        closes = _fcn_lseg_closes_frame(df_prices, rics).dropna()
+        log_returns = np.log(closes / closes.shift(1)).dropna()
+        if log_returns.empty or len(log_returns) < 21:
+            return {"ok": False, "error": "Not enough overlapping return history."}
+
+        cm = log_returns.corr()
+        out: dict = {
+            "ok": True,
+            "rics": rics,
+            "matrix": cm.round(4),
+            "error": None,
+        }
+        if len(rics) >= 2:
+            out["corr01"] = float(cm.iloc[0, 1])
+        if len(rics) >= 3:
+            out["corr02"] = float(cm.iloc[0, 2])
+            out["corr12"] = float(cm.iloc[1, 2])
+        return out
+    except Exception as exc:  # pragma: no cover — Workspace / entitlements
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _fcn_lseg_close_session()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fcn_fetch_lseg_option_iv(option_ric: str) -> dict:
+    """
+    Live option snapshot from LSEG pricing (BID/ASK/IMP_VOLT).
+
+    Example SET50 TFEX option: S50M26C950.BK
+    """
+    if not _RD_OK:
+        return {"ok": False, "error": "refinitiv.data is not installed."}
+
+    ric = (option_ric or "").strip().upper()
+    if not ric:
+        return {"ok": False, "error": "Option RIC is empty."}
 
     try:
-        ticker_obj = yf.Ticker(yahoo_sym)
-        # ~4 months of daily closes gives us enough for a stable 30d realized vol.
-        hist = ticker_obj.history(period="4mo", interval="1d", auto_adjust=False)
-        if hist is None or hist.empty or "Close" not in hist.columns:
-            return {"ok": False, "error": f"No price history returned for {yahoo_sym}."}
+        _fcn_lseg_open_session()
+        response = _rd_pricing.Definition(
+            universe=[ric],
+            fields=["BID", "ASK", "IMP_VOLT", "STRIKE_PRC", "EXPIR_DATE"],
+        ).get_data()
+        df_opt = response.data.df
+        iv_parsed = _fcn_lseg_option_iv_from_df(df_opt, ric)
+        if not iv_parsed["ok"]:
+            return iv_parsed
+        vol_pct = float(iv_parsed["vol_pct"])
 
-        closes = hist["Close"].dropna()
-        if len(closes) < 21:
-            return {"ok": False, "error": f"Only {len(closes)} closes for {yahoo_sym} (need >=21)."}
+        row = df_opt.iloc[0]
+        bid = row.get("BID")
+        ask = row.get("ASK")
+        mid = None
+        if bid is not None and ask is not None and not (np.isnan(bid) or np.isnan(ask)):
+            mid = float((bid + ask) / 2.0)
 
-        spot = float(closes.iloc[-1])
-        log_ret = np.log(closes / closes.shift(1)).dropna()
-        # 30-day realized vol, annualized at 252 trading days.
-        recent = log_ret.tail(30)
-        realized_vol = float(recent.std() * np.sqrt(252))
-        vol_pct = realized_vol * 100.0
+        return {
+            "ok": True,
+            "option_ric": ric,
+            "vol_pct": vol_pct,
+            "vol_source": "lseg_iv",
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "strike": row.get("STRIKE_PRC"),
+            "expiry": row.get("EXPIR_DATE"),
+            "error": None,
+        }
+    except Exception as exc:  # pragma: no cover
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _fcn_lseg_close_session()
 
-        # Dividend yield — yfinance returns this in 'info' (sometimes as decimal,
-        # sometimes as %). We normalize to a percentage.
-        try:
-            info = ticker_obj.info or {}
-        except Exception:
-            info = {}
-        div_raw = (
-            info.get("dividendYield")
-            or info.get("trailingAnnualDividendYield")
-            or 0.0
+
+def _fcn_lseg_option_iv_from_df(df_opt: pd.DataFrame, ric: str) -> dict:
+    """Parse pricing.Definition().get_data() frame for IMP_VOLT (% p.a.)."""
+    if df_opt is None or df_opt.empty:
+        return {"ok": False, "error": f"No pricing data for {ric}."}
+    row = df_opt.iloc[0]
+    imp = row.get("IMP_VOLT")
+    if imp is None or (isinstance(imp, float) and np.isnan(imp)):
+        return {"ok": False, "error": f"IMP_VOLT missing for {ric}."}
+    vol_pct = float(imp)
+    if vol_pct <= 1.0:
+        vol_pct *= 100.0
+    return {"ok": True, "vol_pct": vol_pct, "error": None}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fcn_fetch_lseg(raw_ticker: str, option_ric: str = "") -> dict:
+    """
+    Fetch spot + vol for one SET underlying via LSEG Workspace.
+
+    Spot: latest TR.CLOSEPRICE from ~1y daily history.
+    Vol: IMP_VOLT from option_ric when provided, else 30d realized vol from history.
+
+    Returns ok, spot, vol_pct, div_yield_pct, source_ticker, vol_source, error.
+    """
+    if not _RD_OK:
+        return {"ok": False, "error": "refinitiv.data is not installed. pip install refinitiv-data"}
+
+    ric, err = _fcn_ticker_to_ric(raw_ticker)
+    if err:
+        return {"ok": False, "error": err}
+
+    opt = (option_ric or "").strip().upper()
+    start, end = _fcn_lseg_history_window()
+    try:
+        _fcn_lseg_open_session()
+
+        vol_pct: float
+        vol_source: str
+        if opt:
+            response = _rd_pricing.Definition(
+                universe=[opt],
+                fields=["BID", "ASK", "IMP_VOLT", "STRIKE_PRC", "EXPIR_DATE"],
+            ).get_data()
+            iv_parsed = _fcn_lseg_option_iv_from_df(response.data.df, opt)
+            if not iv_parsed["ok"]:
+                return iv_parsed
+            vol_pct = float(iv_parsed["vol_pct"])
+            vol_source = "lseg_iv"
+
+        df_prices = rd.get_history(
+            universe=[ric],
+            fields=["TR.CLOSEPRICE"],
+            start=start,
+            end=end,
+            interval="daily",
         )
-        div_yield_pct = float(div_raw) * 100.0 if div_raw <= 1.0 else float(div_raw)
+        closes = _fcn_lseg_closes_frame(df_prices, [ric])[ric].dropna()
+        spot = float(closes.iloc[-1])
+
+        if not opt:
+            vol_pct = _fcn_lseg_realized_vol_pct(closes)
+            vol_source = "lseg_realized"
+
+        div_yield_pct = 0.0
+        try:
+            fund = rd.get_data(universe=[ric], fields=["TR.DividendYield"])
+            if fund is not None and not fund.empty:
+                dy = fund.iloc[0].get("TR.DividendYield")
+                if dy is not None and not (isinstance(dy, float) and np.isnan(dy)):
+                    div_yield_pct = float(dy) * 100.0 if float(dy) <= 1.0 else float(dy)
+        except Exception:
+            pass
 
         return {
             "ok": True,
             "spot": spot,
             "vol_pct": vol_pct,
             "div_yield_pct": div_yield_pct,
-            "source_ticker": yahoo_sym,
+            "source_ticker": ric,
+            "vol_source": vol_source,
+            "option_ric": opt or None,
             "error": None,
         }
-    except Exception as exc:  # pragma: no cover — network paths
+    except Exception as exc:  # pragma: no cover
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        _fcn_lseg_close_session()
+
+
+def _fcn_apply_lseg_correlations(n_assets: int, result: dict) -> None:
+    """Push LSEG correlation estimates into session_state slider keys."""
+    if n_assets >= 2 and result.get("corr01") is not None:
+        st.session_state["fcn_corr01"] = float(result["corr01"])
+    if n_assets >= 3:
+        if result.get("corr02") is not None:
+            st.session_state["fcn_corr02"] = float(result["corr02"])
+        if result.get("corr12") is not None:
+            st.session_state["fcn_corr12"] = float(result["corr12"])
 
 
 def _fcn_apply_fetch(i: int, result: dict) -> None:
@@ -3895,48 +4189,72 @@ def fcn_quote_page() -> None:
         st.session_state["fcn_vols"] = (st.session_state["fcn_vols"] + [25.0] * 3)[:n_assets]
         st.session_state["fcn_divs"] = (st.session_state["fcn_divs"] + [3.0] * 3)[:n_assets]
 
-        # Bulk "Fetch all" button — one click pulls live spot / 30d realized vol
-        # / dividend yield from Yahoo for every asset in the current configuration.
-        bulk_col_btn, bulk_col_note = st.columns([1, 4])
-        with bulk_col_btn:
-            fetch_all_clicked = st.button(
-                "↻ Fetch all from Yahoo",
+        # Bulk fetch — LSEG Workspace (Refinitiv) only
+        bulk_btn, bulk_col_note = st.columns([1, 4])
+        with bulk_btn:
+            fetch_all_lseg = st.button(
+                "↻ Fetch all from LSEG",
                 key="fcn_fetch_all",
                 use_container_width=True,
-                disabled=not _YF_OK,
+                disabled=not _RD_OK,
                 help=(
-                    "**ดึงข้อมูลทุกหุ้นจาก Yahoo Finance พร้อมกัน**\n\n"
-                    "• พิมพ์ชื่อย่อ SET เปล่าๆ (เช่น CPALL, KBANK, PTT) → ระบบเติม `.BK` ให้อัตโนมัติ\n"
-                    "• ถ้าใส่ symbol เต็มเอง (เช่น `CPALL.BK`, `AAPL`, `^SET`) → ใช้ตามที่พิมพ์\n\n"
-                    "ค่าที่ดึงมา: Spot ล่าสุด, Realized Vol 30 วัน, Dividend Yield"
+                    "**ดึงจาก LSEG Workspace (Refinitiv)**\n\n"
+                    "ต้องเปิดโปรแกรม Workspace ทิ้งไว้บนเครื่อง\n"
+                    "Spot จาก TR.CLOSEPRICE · Vol จาก Option RIC (ถ้ากรอก) หรือ Realized 30d"
                 ),
             )
         with bulk_col_note:
-            if _YF_OK:
+            if _RD_OK:
+                key_hint = (
+                    "app key loaded"
+                    if _fcn_lseg_app_key()
+                    else "set `LSEG_APP_KEY` or `.streamlit/secrets.toml` [lseg] app_key"
+                )
                 st.caption(
-                    "Tip · type bare SET tickers like `CPALL` — Yahoo lookup uses `CPALL.BK`. "
-                    "Implied vol is filled with a **30-day realized vol** proxy; override with a "
-                    "broker-quoted IV if you have one."
+                    f"LSEG ({key_hint}): bare SET tickers → `CPALL.BK`; optional Option RIC for **IMP_VOLT**."
                 )
             else:
-                st.caption("`yfinance` not installed — auto-fetch is disabled. Install with `pip install yfinance`.")
+                st.caption(
+                    "`refinitiv-data` not installed — install with `pip install refinitiv-data` "
+                    "and configure your LSEG app key."
+                )
 
-        if fetch_all_clicked:
-            failures: list[str] = []
-            successes: list[str] = []
+        with st.expander("LSEG Workspace · option RICs (implied vol)", expanded=False):
+            st.caption(
+                "Leave blank to use **30-day realized vol** from LSEG equity history. "
+                "For broker IV, paste the listed option RIC (TFEX / SET options)."
+            )
+            opt_cols = st.columns(n_assets)
+            for i in range(n_assets):
+                with opt_cols[i]:
+                    st.text_input(
+                        f"Option RIC #{i+1}",
+                        value=st.session_state.get(f"fcn_lseg_opt_{i}", ""),
+                        key=f"fcn_lseg_opt_{i}",
+                        placeholder="S50M26C950.BK",
+                        help="Refinitiv pricing universe for IMP_VOLT, BID/ASK.",
+                    )
+
+        if fetch_all_lseg:
+            failures = []
+            successes = []
             for i in range(n_assets):
                 tkr = st.session_state.get(f"fcn_tkr_{i}", "").strip()
                 if not tkr:
                     failures.append(f"#{i+1}: empty ticker")
                     continue
-                res = _fcn_fetch_yahoo(tkr)
+                opt_ric = st.session_state.get(f"fcn_lseg_opt_{i}", "").strip()
+                res = _fcn_fetch_lseg(tkr, opt_ric)
                 if res["ok"]:
                     _fcn_apply_fetch(i, res)
-                    successes.append(f"{res['source_ticker']} @ {res['spot']:.2f}")
+                    src = res.get("vol_source", "lseg")
+                    successes.append(
+                        f"{res['source_ticker']} @ {res['spot']:.2f} ({src})"
+                    )
                 else:
                     failures.append(f"{tkr}: {res['error']}")
             if successes:
-                st.toast(f"Fetched {len(successes)}: " + " · ".join(successes), icon="✅")
+                st.toast(f"LSEG · {len(successes)}: " + " · ".join(successes), icon="✅")
             for msg in failures:
                 st.warning(msg)
             if successes:
@@ -3961,36 +4279,36 @@ def fcn_quote_page() -> None:
                         ),
                     )
                 )
-                # Per-asset fetch button — lets the user refresh one row without
-                # re-hitting Yahoo for the others (and without losing manual overrides).
                 if st.button(
-                    "↻ Fetch this one",
+                    "↻ Fetch from LSEG",
                     key=f"fcn_fetch_{i}",
                     use_container_width=True,
-                    disabled=not _YF_OK,
-                    help=(
-                        "**ดึงข้อมูลเฉพาะหุ้นนี้จาก Yahoo**\n\n"
-                        "ใช้เมื่อคุณต้องการอัปเดตหุ้นตัวเดียว โดยไม่ต้องดึงข้อมูลหุ้นอื่นใหม่ "
-                        "(เหมาะกับการแก้ค่าเฉพาะจุดหลังจากกรอก Override ด้วยมือไปแล้ว)"
-                    ),
+                    disabled=not _RD_OK,
+                    help="ดึง Spot / Vol / Div จาก LSEG Workspace — ใช้ Option RIC ด้านบนถ้ามี",
                 ):
                     tkr = st.session_state.get(f"fcn_tkr_{i}", "").strip()
                     if not tkr:
                         st.warning("Enter a ticker first.")
                     else:
-                        res = _fcn_fetch_yahoo(tkr)
+                        opt_ric = st.session_state.get(f"fcn_lseg_opt_{i}", "").strip()
+                        res = _fcn_fetch_lseg(tkr, opt_ric)
                         if res["ok"]:
                             _fcn_apply_fetch(i, res)
+                            vol_note = ""
+                            if res.get("vol_source") == "lseg_iv":
+                                vol_note = " · IV from option"
+                            elif res.get("vol_source") == "lseg_realized":
+                                vol_note = " · LSEG realized 30d"
                             st.toast(
-                                f"✓ {res['source_ticker']}: "
+                                f"✓ LSEG {res['source_ticker']}: "
                                 f"spot {res['spot']:.2f} · "
                                 f"vol {res['vol_pct']:.1f}% · "
-                                f"div {res['div_yield_pct']:.2f}%",
+                                f"div {res['div_yield_pct']:.2f}%{vol_note}",
                                 icon="✅",
                             )
                             st.rerun()
                         else:
-                            st.error(f"Fetch failed: {res['error']}")
+                            st.error(f"LSEG fetch failed: {res['error']}")
                 spots.append(
                     st.number_input(
                         "Live spot",
@@ -4004,7 +4322,7 @@ def fcn_quote_page() -> None:
                             "ใช้เป็นจุดอ้างอิงเริ่มต้น — Strike, KI, KO ทั้งหมดคำนวณเป็น "
                             "**% ของราคา Spot นี้**\n\n"
                             "• Strike 95% หมายถึง 95% ของราคานี้\n"
-                            "• กดปุ่ม **Fetch** เพื่อดึงราคาปิดล่าสุดจาก Yahoo อัตโนมัติ"
+                            "• กดปุ่ม **Fetch from LSEG** เพื่อดึงราคาปิดล่าสุดจาก Workspace"
                         ),
                     )
                 )
@@ -4018,9 +4336,9 @@ def fcn_quote_page() -> None:
                         help=(
                             "**Implied Volatility — ความผันผวนรายปี (% p.a.)**\n\n"
                             "ค่าหลักที่ใช้ใน GBM Model: กำหนด Drift และ Diffusion ของราคา\n\n"
-                            "• ปุ่ม **Fetch** จะเติมค่า **Realized Vol 30 วัน** จากราคาในอดีตให้ก่อน "
-                            "(เป็นค่าประมาณ — Yahoo ฟรีไม่มี IV จริง)\n"
-                            "• ถ้ามี **Implied Vol จาก Broker** แนะนำให้กรอกแทน\n\n"
+                            "• ปุ่ม **Fetch** เติม **Realized Vol 30 วัน** จาก LSEG history "
+                            "หรือ **IMP_VOLT** ถ้ากรอก Option RIC\n"
+                            "• แก้ด้วยมือได้ถ้ามี IV จาก Broker\n\n"
                             "ผลกระทบ:\n"
                             "• Vol สูง → ราคาแกว่งมาก → KO/KI โดนง่ายขึ้น → Coupon สูง\n"
                             "• Vol ต่ำ → ราคานิ่ง → Coupon ต่ำ"
@@ -4039,7 +4357,7 @@ def fcn_quote_page() -> None:
                             "หักออกจาก Drift ในสูตร GBM: **(r − q − ½σ²)**\n\n"
                             "• หุ้นไทยที่จ่ายปันผลสูง (ธนาคาร, พลังงาน) → ลด Drift → "
                             "Coupon ต่ำลงเล็กน้อย\n"
-                            "• ปุ่ม **Fetch** จะดึง Dividend Yield ล่าสุดจาก Yahoo (ค่า TTM)"
+                            "• ปุ่ม **Fetch** จะดึง TR.DividendYield จาก LSEG (ถ้ามีสิทธิ์ข้อมูล)"
                         ),
                     )
                 )
@@ -4051,6 +4369,44 @@ def fcn_quote_page() -> None:
     else:
         with st.container(border=True):
             st.markdown("##### Correlation matrix")
+            corr_hdr, corr_btn = st.columns([3, 1])
+            with corr_hdr:
+                st.caption(
+                    "Pairwise ρ from log returns · override sliders manually, or pull "
+                    "**~1y daily history** from LSEG (Workspace open)."
+                )
+            with corr_btn:
+                lseg_corr_clicked = st.button(
+                    "↻ LSEG matrix",
+                    key="fcn_lseg_corr",
+                    use_container_width=True,
+                    disabled=not _RD_OK,
+                    help="rd.get_history → log returns → correlation matrix (FCN Cholesky input)",
+                )
+            if lseg_corr_clicked:
+                raw = tuple(
+                    st.session_state.get(f"fcn_tkr_{j}", "").strip() for j in range(n_assets)
+                )
+                if any(not t for t in raw):
+                    st.warning("Fill every ticker before fetching correlations.")
+                else:
+                    with st.spinner("Pulling LSEG history for correlation matrix…"):
+                        cres = _fcn_fetch_lseg_correlation(raw)
+                    if cres["ok"]:
+                        _fcn_apply_lseg_correlations(n_assets, cres)
+                        st.session_state["fcn_lseg_corr_matrix"] = cres["matrix"]
+                        st.toast("LSEG correlation matrix applied to sliders.", icon="✅")
+                        st.rerun()
+                    else:
+                        st.error(f"LSEG correlation failed: {cres['error']}")
+
+            if st.session_state.get("fcn_lseg_corr_matrix") is not None:
+                st.dataframe(
+                    st.session_state["fcn_lseg_corr_matrix"],
+                    use_container_width=True,
+                    hide_index=False,
+                )
+
             ccols = st.columns(3 if n_assets == 3 else 1)
             # Pair (0,1)
             with ccols[0]:
