@@ -31,8 +31,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
-import os
-import re
 
 import numpy as np
 import pandas as pd
@@ -47,14 +45,6 @@ try:
 except ImportError:
     yf = None  # type: ignore[assignment]
     _YF_OK = False
-
-try:
-    import anthropic
-
-    _ANTHROPIC_OK = True
-except ImportError:
-    anthropic = None  # type: ignore[assignment]
-    _ANTHROPIC_OK = False
 
 try:
     from scipy.stats import multivariate_normal as _scipy_mvn
@@ -4516,225 +4506,6 @@ def fcn_how_it_works() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Thai Mutual Fund Screening Assistant (Anthropic + web search)
-# ---------------------------------------------------------------------------
-
-FUND_SCREENER_MODEL = "claude-opus-4-1"
-FUND_SCREENER_MAX_TOKENS = 4096
-FUND_SCREENER_MAX_SEARCHES_PER_TURN = 8
-FUND_SCREENER_USER_LOCATION = {
-    "type": "approximate",
-    "city": "Bangkok",
-    "region": "Bangkok",
-    "country": "TH",
-    "timezone": "Asia/Bangkok",
-}
-FUND_SCREENER_SYSTEM_PROMPT = """\
-# บทบาท (Role)
-คุณคือผู้ช่วยวิเคราะห์กองทุนรวมสำหรับนักลงทุนไทย ทำหน้าที่เฟ้นหาและเปรียบเทียบ
-กองทุนตามสิ่งที่ผู้ใช้สนใจ โดยยึดหลักข้อมูลเชิงประจักษ์ (data-driven)
-ไม่ใช่การเชียร์กองใดกองหนึ่ง คุณไม่ใช่ที่ปรึกษาการลงทุนที่มีใบอนุญาต
-และทุกคำตอบเป็นข้อมูลประกอบการตัดสินใจเท่านั้น
-
-# หลักการสำคัญ
-- อ้างอิงข้อมูลจริงที่ค้นได้ (หนังสือชี้ชวน, Fund Fact Sheet, เว็บ บลจ.,
-  Morningstar, WealthMagik, SETTRADE/Finnomena/InnovestX) และต้องระบุวันที่ของข้อมูลเสมอ
-- ห้ามแต่งตัวเลขหรือชื่อกอง ถ้าหาข้อมูลไม่ได้ให้บอกตรงๆ ว่าหาไม่เจอ
-- โปร่งใสเรื่องค่าธรรมเนียม เพราะกระทบผลตอบแทนระยะยาวมาก
-- เตือนเสมอว่าผลตอบแทนในอดีตไม่การันตีอนาคต
-
-# ขั้นตอนการทำงาน
-1) ถามคำถามจำเป็น 2-4 ข้อ (บัญชีภาษี, ระยะเวลา, ปันผล/สะสม, hedge ค่าเงิน)
-2) แปลงธีมที่ผู้ใช้สนใจเป็นหมวดสินทรัพย์/ดัชนีที่ค้นได้จริง
-3) ค้นกองที่มีอยู่จริงในไทยให้ครอบคลุม
-4) คัดกรองตามค่าธรรมเนียม, underlying, AUM, tracking error, FX hedge, ผลตอบแทนย้อนหลัง, สภาพคล่อง
-5) สรุปเป็นตารางเปรียบเทียบ 3-5 กอง พร้อม trade-off
-6) ปิดท้ายด้วยคำเตือนความเสี่ยงทุกครั้ง
-
-# รูปแบบการตอบ
-- ภาษาไทยเป็นหลัก กระชับ ตรงประเด็น
-- ใช้ตารางเมื่อเทียบหลายกอง
-- ระบุแหล่งที่มาและวันที่ของข้อมูลเสมอ
-- ถ้าข้อมูลขัดแย้งกัน ให้แนะนำให้ยืนยันกับ บลจ. โดยตรง
-"""
-
-
-def _fund_screener_resolve_api_key() -> str:
-    """API key from env, Streamlit secrets, or session (sidebar / page form)."""
-    def _normalize(raw: str) -> str:
-        key = str(raw or "").strip().strip("'\"")
-        if not key:
-            return ""
-        # Handle accidental full command pastes like: setx ANTHROPIC_API_KEY sk-ant-...
-        sk_match = re.search(r"(sk-ant-[A-Za-z0-9_-]+)", key)
-        if sk_match:
-            return sk_match.group(1).strip().strip("'\"")
-        return key
-
-    key = _normalize(os.environ.get("ANTHROPIC_API_KEY", ""))
-    if key:
-        return key
-    try:
-        if "ANTHROPIC_API_KEY" in st.secrets:
-            key = _normalize(str(st.secrets["ANTHROPIC_API_KEY"]))
-            if key:
-                return key
-    except Exception:
-        pass
-    return _normalize(str(st.session_state.get("fund_screener_api_key", "")))
-
-
-def _fund_screener_masked_key_info(key: str) -> str:
-    """Safe key diagnostics for UI."""
-    if not key:
-        return "ไม่พบ key"
-    if len(key) <= 12:
-        return f"{key[:4]}... (len={len(key)})"
-    return f"{key[:8]}...{key[-4:]} (len={len(key)})"
-
-
-def _fund_screener_render_api_key_setup() -> None:
-    """Show setup UI when no API key is configured."""
-    st.warning("ยังไม่พบ Anthropic API key — ใส่ด้านล่าง หรือตั้งค่าก่อนรันแอป")
-    with st.expander("ใส่ API key ในแอป (ใช้เฉพาะ session นี้)", expanded=True):
-        with st.form("fund_screener_api_form"):
-            entered = st.text_input(
-                "Anthropic API Key",
-                type="password",
-                placeholder="sk-ant-api03-...",
-                help="ได้จาก console.anthropic.com — เก็บเฉพาะในเบราว์เซอร์/session นี้",
-            )
-            if st.form_submit_button("บันทึกและเริ่มใช้งาน", type="primary"):
-                if entered.strip():
-                    st.session_state.fund_screener_api_key = entered.strip()
-                    st.rerun()
-                else:
-                    st.error("กรุณาใส่ API key")
-    st.markdown("**วิธีอื่น (แนะนำถ้ารันบ่อย)**")
-    st.code(
-        "# PowerShell (session ปัจจุบัน)\n"
-        '$env:ANTHROPIC_API_KEY="sk-ant-..."\n'
-        "streamlit run wwwwww.py\n\n"
-        "# หรือสร้างไฟล์ .streamlit/secrets.toml\n"
-        'ANTHROPIC_API_KEY = "sk-ant-..."',
-        language="powershell",
-    )
-
-
-def _fund_screener_extract_sources(content_blocks: list[dict]) -> list[tuple[str, str]]:
-    """Return unique (title, url) pairs from web search result blocks."""
-    seen: set[str] = set()
-    out: list[tuple[str, str]] = []
-    for block in content_blocks:
-        if block.get("type") != "web_search_tool_result":
-            continue
-        for item in block.get("content", []) or []:
-            url = item.get("url")
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            out.append((item.get("title") or url, url))
-    return out
-
-
-def fund_screener_hero() -> None:
-    st.title("Thai Mutual Fund Screening Assistant")
-    st.caption("Anthropic + Web Search · คัดกรองกองทุนไทยแบบ data-driven")
-
-
-def fund_screener_chat_page() -> None:
-    st.subheader("คุยกับผู้ช่วยคัดเลือกกองทุน")
-    st.caption(
-        "ตัวอย่างธีม: S&P500, Semiconductor, ทองคำ, หุ้นจีน. "
-        "เครื่องมือนี้เป็นข้อมูลประกอบการตัดสินใจ ไม่ใช่คำแนะนำการลงทุนเฉพาะบุคคล"
-    )
-
-    if not _ANTHROPIC_OK:
-        st.error("ยังไม่ได้ติดตั้ง `anthropic` — รัน `pip install anthropic` แล้วรีสตาร์ตแอป")
-        return
-
-    api_key = _fund_screener_resolve_api_key()
-    if not api_key:
-        _fund_screener_render_api_key_setup()
-        return
-    if not api_key.startswith("sk-ant-"):
-        st.error("รูปแบบ Anthropic API key ไม่ถูกต้อง (ต้องขึ้นต้นด้วย sk-ant-)")
-        _fund_screener_render_api_key_setup()
-        return
-
-    history_key = "fund_screener_messages"
-    if history_key not in st.session_state:
-        st.session_state[history_key] = []
-
-    for msg in st.session_state[history_key]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["text"])
-            if msg.get("sources"):
-                with st.expander("แหล่งอ้างอิง", expanded=False):
-                    for title, url in msg["sources"]:
-                        st.markdown(f"- [{title}]({url})")
-
-    user_prompt = st.chat_input("พิมพ์ธีมที่สนใจ เช่น S&P500 / Semiconductor / ทองคำ / หุ้นจีน")
-    if not user_prompt:
-        return
-
-    st.session_state[history_key].append({"role": "user", "text": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-
-    api_messages: list[dict] = []
-    for msg in st.session_state[history_key]:
-        if msg["role"] == "user":
-            api_messages.append({"role": "user", "content": msg["text"]})
-        else:
-            api_messages.append({"role": "assistant", "content": msg["raw_blocks"]})
-
-    with st.chat_message("assistant"):
-        with st.spinner("กำลังวิเคราะห์และค้นข้อมูลกองทุน..."):
-            try:
-                client = anthropic.Anthropic(api_key=api_key)
-                response = client.messages.create(
-                    model=FUND_SCREENER_MODEL,
-                    max_tokens=FUND_SCREENER_MAX_TOKENS,
-                    system=FUND_SCREENER_SYSTEM_PROMPT,
-                    messages=api_messages,
-                    tools=[
-                        {
-                            "type": "web_search_20250305",
-                            "name": "web_search",
-                            "max_uses": FUND_SCREENER_MAX_SEARCHES_PER_TURN,
-                            "user_location": FUND_SCREENER_USER_LOCATION,
-                        }
-                    ],
-                )
-            except Exception as e:
-                st.error(f"เรียก Anthropic API ไม่สำเร็จ: {e}")
-                return
-
-        text_parts = [block.text for block in response.content if block.type == "text"]
-        answer = "\n".join(part for part in text_parts if part).strip()
-        if not answer:
-            answer = "ไม่พบคำตอบข้อความจากโมเดล (อาจเกิดข้อผิดพลาดชั่วคราว)"
-        st.markdown(answer)
-
-        raw_blocks = [block.model_dump() for block in response.content]
-        sources = _fund_screener_extract_sources(raw_blocks)
-        if sources:
-            with st.expander("แหล่งอ้างอิง", expanded=False):
-                for title, url in sources:
-                    st.markdown(f"- [{title}]({url})")
-
-    st.session_state[history_key].append(
-        {
-            "role": "assistant",
-            "text": answer,
-            "sources": sources,
-            "raw_blocks": raw_blocks,
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
 # Topic registry — add topics here. They appear in the sidebar in this order.
 # ---------------------------------------------------------------------------
 
@@ -4772,14 +4543,6 @@ TOPICS: Dict[str, Topic] = {
             "Price & quote": fcn_quote_page,
             "Preset scenarios": fcn_preset_scenarios_page,
             "How it works": fcn_how_it_works,
-        },
-    ),
-    "Thai Fund Screener": Topic(
-        name="Thai Fund Screener",
-        subtitle="Anthropic web-search assistant for Thai mutual fund screening",
-        hero=fund_screener_hero,
-        pages={
-            "Chat assistant": fund_screener_chat_page,
         },
     ),
     "+ Add new topic": Topic(
@@ -4832,35 +4595,6 @@ with st.sidebar:
                     type="primary" if is_active_page else "secondary",
                 ):
                     navigate(topic_name, page_name)
-
-    if st.session_state.active_topic == "Thai Fund Screener":
-        st.divider()
-        st.caption("Anthropic API")
-        current_api_key = _fund_screener_resolve_api_key()
-        if current_api_key:
-            st.success("API key พร้อมใช้งาน")
-            st.caption(f"Key: {_fund_screener_masked_key_info(current_api_key)}")
-            if st.button("ทดสอบ API key", key="fund_screener_test_key", use_container_width=True):
-                try:
-                    _client = anthropic.Anthropic(api_key=current_api_key)
-                    _ = _client.messages.create(
-                        model=FUND_SCREENER_MODEL,
-                        max_tokens=16,
-                        messages=[{"role": "user", "content": "ping"}],
-                    )
-                    st.success("ทดสอบสำเร็จ: API key ใช้งานได้")
-                except Exception as e:
-                    st.error(f"ทดสอบไม่ผ่าน: {e}")
-            if st.button("ลบ key จาก session", key="fund_screener_clear_key"):
-                st.session_state.pop("fund_screener_api_key", None)
-                st.rerun()
-        else:
-            with st.form("fund_screener_sidebar_api"):
-                sk = st.text_input("API Key", type="password", label_visibility="collapsed")
-                if st.form_submit_button("บันทึก key", use_container_width=True):
-                    if sk.strip():
-                        st.session_state.fund_screener_api_key = sk.strip()
-                        st.rerun()
 
     # Topic-specific quick stats (only meaningful for Gold right now)
     if st.session_state.active_topic == "Gold (XAU/USD)":
