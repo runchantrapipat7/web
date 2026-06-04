@@ -30,6 +30,7 @@ Adding a new topic
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -81,18 +82,20 @@ class Topic:
 
 
 # ---------------------------------------------------------------------------
-# Snapshot data — edit these constants to refresh the dashboard.
+# Gold snapshot — spot/DXY refresh live via Yahoo; macro prints update manually.
 # ---------------------------------------------------------------------------
 
-AS_OF = "May 25, 2026 · 17:02 ICT"
-SPOT = 4565.25
-DAILY_CHANGE_PCT = -0.02
-PREV_CLOSE = 4509.38
+_ICT = timezone(timedelta(hours=7))
+
+AS_OF = "Jun 4, 2026 · live"
+SPOT = 4500.60
+DAILY_CHANGE_PCT = 0.0
+PREV_CLOSE = 4500.60
 ATH = 5602.23
 
-DXY = 99.32
+DXY = 99.45
 TIPS_10Y = 2.18
-NOMINAL_10Y = 4.56
+NOMINAL_10Y = 4.49
 CPI_YOY = 3.8
 CORE_CPI_YOY = 2.8
 CORE_PCE_YOY = 3.2
@@ -108,8 +111,8 @@ REAL_YIELD_SERIES = pd.DataFrame(
 
 DXY_SERIES = pd.DataFrame(
     {
-        "date": ["Apr 24", "Apr 30", "May 06", "May 12", "May 15", "May 19", "May 21", "May 22"],
-        "value": [98.53, 98.06, 98.02, 98.30, 99.28, 99.33, 99.26, 99.24],
+        "date": ["May 28", "May 29", "May 30", "Jun 02", "Jun 03", "Jun 04"],
+        "value": [99.10, 99.22, 99.18, 99.35, 99.52, 99.45],
     }
 )
 
@@ -170,50 +173,134 @@ class Horizon:
     rationale: str
 
 
-HORIZONS = [
-    Horizon(
-        name="30 days",
-        until="to Jun 25, 2026",
-        bias="Neutral-bearish",
-        bias_color="#c98a2f",
-        range_low=4400,
-        range_high=4780,
-        target=4520,
-        rationale=(
-            "Hot CPI keeps real yields elevated; Apr PCE (May 28) is the next binary catalyst. "
-            "Managed Money is long-loaded at higher levels — long-liquidation risk if $4,500 "
-            "breaks. Floor expected at the central-bank bid zone."
+def _gold_horizons() -> list[Horizon]:
+    """Forecast horizons with rolling end dates from today."""
+    today = datetime.now(_ICT)
+    d30 = today + timedelta(days=30)
+    d90 = today + timedelta(days=90)
+    d365 = today + timedelta(days=365)
+
+    def _until(d: datetime) -> str:
+        return f"to {d.strftime('%b %d, %Y')}"
+
+    return [
+        Horizon(
+            name="30 days",
+            until=_until(d30),
+            bias="Neutral-bearish",
+            bias_color="#c98a2f",
+            range_low=4400,
+            range_high=4780,
+            target=4520,
+            rationale=(
+                "Hot CPI keeps real yields elevated; the next inflation prints are the "
+                "near-term binary catalyst. Managed Money is long-loaded at higher levels — "
+                "long-liquidation risk if $4,500 breaks. Floor expected at the central-bank bid zone."
+            ),
         ),
-    ),
-    Horizon(
-        name="3 months",
-        until="to Aug 25, 2026",
-        bias="Constructive",
-        bias_color="#2f9d6a",
-        range_low=4450,
-        range_high=5100,
-        target=4850,
-        rationale=(
-            "JPMorgan flags 'H2 demand re-acceleration.' Q2 central-bank data lands in July; "
-            "if inflation peaks and the Fed shifts dovish, real yields roll over and gold breaks "
-            "the $4,900 range high. Watch Asian ETF flows — the structural bid layer."
+        Horizon(
+            name="3 months",
+            until=_until(d90),
+            bias="Constructive",
+            bias_color="#2f9d6a",
+            range_low=4450,
+            range_high=5100,
+            target=4850,
+            rationale=(
+                "JPMorgan flags 'H2 demand re-acceleration.' Q2 central-bank data lands in July; "
+                "if inflation peaks and the Fed shifts dovish, real yields roll over and gold breaks "
+                "the $4,900 range high. Watch Asian ETF flows — the structural bid layer."
+            ),
         ),
-    ),
-    Horizon(
-        name="12 months",
-        until="to May 2027",
-        bias="Bullish",
-        bias_color="#2f9d6a",
-        range_low=5200,
-        range_high=6300,
-        target=5800,
-        rationale=(
-            "Consensus blend of major bank targets. Bull case ($7,200, UBS) requires Western "
-            "retail/ETF rotation on top of the central-bank bid. Bear case ($4,450, HSBC) "
-            "assumes a peace dividend + sticky real yields. ATH ($5,602) likely revisited."
+        Horizon(
+            name="12 months",
+            until=_until(d365),
+            bias="Bullish",
+            bias_color="#2f9d6a",
+            range_low=5200,
+            range_high=6300,
+            target=5800,
+            rationale=(
+                "Consensus blend of major bank targets. Bull case ($7,200, UBS) requires Western "
+                "retail/ETF rotation on top of the central-bank bid. Bear case ($4,450, HSBC) "
+                "assumes a peace dividend + sticky real yields. ATH ($5,602) likely revisited."
+            ),
         ),
-    ),
-]
+    ]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _gold_fetch_live() -> dict:
+    """Live gold spot, DXY, and 10Y nominal from Yahoo Finance."""
+    if not _YF_OK:
+        return {"ok": False, "error": "yfinance not installed"}
+    try:
+        gold_hist = yf.Ticker("GC=F").history(period="1y", auto_adjust=True)
+        dxy_hist = yf.Ticker("DX-Y.NYB").history(period="2mo", auto_adjust=True)
+        tnx_hist = yf.Ticker("^TNX").history(period="5d", auto_adjust=True)
+
+        if gold_hist is None or gold_hist.empty:
+            return {"ok": False, "error": "No gold price history"}
+
+        spot = float(gold_hist["Close"].iloc[-1])
+        prev = float(gold_hist["Close"].iloc[-2]) if len(gold_hist) > 1 else spot
+        daily_change = (spot / prev - 1) * 100 if prev else 0.0
+        ath = float(gold_hist["High"].max())
+
+        dxy_val = float(dxy_hist["Close"].iloc[-1]) if dxy_hist is not None and not dxy_hist.empty else DXY
+        nominal = float(tnx_hist["Close"].iloc[-1]) if tnx_hist is not None and not tnx_hist.empty else NOMINAL_10Y
+
+        dxy_tail = dxy_hist.tail(8) if dxy_hist is not None and not dxy_hist.empty else DXY_SERIES
+        if isinstance(dxy_tail, pd.DataFrame) and not dxy_tail.empty:
+            dxy_series = pd.DataFrame(
+                {
+                    "date": [d.strftime("%b %d") for d in dxy_tail.index],
+                    "value": [float(v) for v in dxy_tail["Close"].tolist()],
+                }
+            )
+        else:
+            dxy_series = DXY_SERIES
+
+        as_of = datetime.now(_ICT).strftime("%b %d, %Y · %H:%M ICT")
+
+        return {
+            "ok": True,
+            "as_of": as_of,
+            "spot": spot,
+            "prev_close": prev,
+            "daily_change_pct": daily_change,
+            "dxy": dxy_val,
+            "nominal_10y": nominal,
+            "ath": ath,
+            "dxy_series": dxy_series,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _gold_apply_market() -> None:
+    """Refresh module-level gold market fields from Yahoo (cached 15 min)."""
+    global AS_OF, SPOT, PREV_CLOSE, DAILY_CHANGE_PCT, DXY, NOMINAL_10Y, ATH, DXY_SERIES, HORIZONS
+
+    live = _gold_fetch_live()
+    HORIZONS = _gold_horizons()
+    if not live.get("ok"):
+        return
+    AS_OF = live["as_of"]
+    SPOT = live["spot"]
+    PREV_CLOSE = live["prev_close"]
+    DAILY_CHANGE_PCT = live["daily_change_pct"]
+    DXY = live["dxy"]
+    NOMINAL_10Y = live["nominal_10y"]
+    ATH = live["ath"]
+    DXY_SERIES = live["dxy_series"]
+
+
+def _gold_request_price_refresh() -> None:
+    st.session_state.gold_refresh_requested = True
+
+
+HORIZONS = _gold_horizons()
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +393,12 @@ def gold_hero() -> None:
             f"data as of {AS_OF}"
         )
     with col_pill:
+        st.markdown("<div style='padding-top:18px;'>", unsafe_allow_html=True)
+        if st.button("Refresh price", key="gold_refresh_price", use_container_width=True):
+            _gold_request_price_refresh()
+            st.rerun()
         st.markdown(
-            "<div style='text-align:right; padding-top:24px;'>"
+            "<div style='text-align:right; padding-top:8px;'>"
             "<span style='background:#1d3a5f; color:#7ab8ff; padding:4px 10px; "
             "border-radius:12px; font-size:12px;'>LIVE SPOT</span></div>",
             unsafe_allow_html=True,
@@ -316,9 +407,9 @@ def gold_hero() -> None:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot price", f"${SPOT:,.2f}", f"{DAILY_CHANGE_PCT:+.2f}%")
     c2.metric("Prev close", f"${PREV_CLOSE:,.2f}", f"{(SPOT - PREV_CLOSE) / PREV_CLOSE * 100:+.2f}%")
-    c3.metric("DXY", f"{DXY:.2f}", "Holding 99 floor")
-    c4.metric("10Y real yield", f"{TIPS_10Y:.2f}%", "Rising headwind", delta_color="inverse")
-    c5.metric("CPI y/y (Apr)", f"{CPI_YOY:.1f}%", "Re-accelerating", delta_color="inverse")
+    c3.metric("DXY", f"{DXY:.2f}", "Live · Yahoo")
+    c4.metric("10Y nominal", f"{NOMINAL_10Y:.2f}%", "Live · Yahoo")
+    c5.metric("CPI y/y (Apr)", f"{CPI_YOY:.1f}%", "BLS print · manual")
 
 
 # ---------------------------------------------------------------------------
@@ -478,10 +569,10 @@ def section_macro() -> None:
                 "Geopolitics",
             ],
             "Reading": [
-                "99.32 · 99–99.5 range",
-                "2.18% (May 21)",
+                f"{DXY:.2f} · live (Yahoo)",
+                f"{TIPS_10Y:.2f}% TIPS · {NOMINAL_10Y:.2f}% nominal (live)",
                 "3.8% (Apr) · core 2.8%",
-                "3.2% (Mar) · Apr due May 28",
+                "3.2% (Mar) · check latest BEA print",
                 f"~{FED_HIKE_ODDS_DEC}% odds of Dec rate hike",
                 "244t Q1 · WGC FY 700–900t",
                 "+$6.6B Apr · 4,137t total",
@@ -987,6 +1078,115 @@ def section_risk() -> None:
 YZ_PERIOD_DAYS = {"6mo": 180, "1y": 365, "2y": 730, "5y": 1825}
 
 
+def _yz_df_row(df: pd.DataFrame, labels: list[str]) -> Optional[pd.Series]:
+    if df is None or df.empty:
+        return None
+    for label in labels:
+        if label in df.index:
+            series = df.loc[label].dropna()
+            if not series.empty:
+                return series
+    return None
+
+
+def _yz_latest_value(df: pd.DataFrame, labels: list[str]) -> Optional[float]:
+    series = _yz_df_row(df, labels)
+    if series is None:
+        return None
+    return float(series.iloc[0])
+
+
+def _yz_fetch_statement(ticker, getter_name: str, prop_name: str) -> pd.DataFrame:
+    """Try yfinance getter methods first, then legacy properties."""
+    for source in (getter_name, prop_name):
+        try:
+            obj = getattr(ticker, source)
+            df = obj() if source == getter_name and callable(obj) else obj
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _yz_merge_fast_info(info: dict, ticker) -> dict:
+    merged = dict(info or {})
+    try:
+        fast = ticker.fast_info
+        fast_get = fast.get if hasattr(fast, "get") else lambda k, d=None: getattr(fast, k, d)
+        mapping = {
+            "last_price": "currentPrice",
+            "market_cap": "marketCap",
+            "fifty_day_average": "fiftyDayAverage",
+            "two_hundred_day_average": "twoHundredDayAverage",
+            "year_high": "fiftyTwoWeekHigh",
+            "year_low": "fiftyTwoWeekLow",
+            "previous_close": "previousClose",
+            "open": "open",
+            "currency": "currency",
+            "quote_type": "quoteType",
+        }
+        for src, dst in mapping.items():
+            if merged.get(dst) is None:
+                val = fast_get(src)
+                if val is not None:
+                    merged[dst] = val
+    except Exception:
+        pass
+    return merged
+
+
+def _yz_enrich_info_from_statements(
+    info: dict,
+    financials: pd.DataFrame,
+    cashflow: pd.DataFrame,
+    balance: pd.DataFrame,
+) -> dict:
+    """Fill missing summary fields from annual statements when quoteSummary is sparse."""
+    merged = dict(info or {})
+    fill = {
+        "totalRevenue": _yz_latest_value(
+            financials, ["Total Revenue", "TotalRevenue", "Operating Revenue", "OperatingRevenue"]
+        ),
+        "grossProfits": _yz_latest_value(financials, ["Gross Profit", "GrossProfit"]),
+        "netIncomeToCommon": _yz_latest_value(
+            financials,
+            ["Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"],
+        ),
+        "freeCashflow": _yz_latest_value(cashflow, ["Free Cash Flow", "FreeCashFlow"]),
+        "totalCash": _yz_latest_value(
+            balance, ["Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash Cash Equivalents And Short Term Investments"]
+        ),
+        "totalDebt": _yz_latest_value(balance, ["Total Debt", "TotalDebt", "Long Term Debt", "LongTermDebt"]),
+    }
+    for key, val in fill.items():
+        if merged.get(key) is None and val is not None:
+            merged[key] = val
+    if merged.get("operatingMargins") is None:
+        rev = merged.get("totalRevenue")
+        op = _yz_latest_value(financials, ["Operating Income", "OperatingIncome", "EBIT"])
+        if rev and op and rev > 0:
+            merged["operatingMargins"] = op / rev
+    if merged.get("profitMargins") is None:
+        rev = merged.get("totalRevenue")
+        ni = merged.get("netIncomeToCommon")
+        if rev and ni and rev > 0:
+            merged["profitMargins"] = ni / rev
+    return merged
+
+
+def _yz_data_is_partial(info: dict, cashflow: pd.DataFrame, financials: pd.DataFrame) -> bool:
+    has_info = any(
+        info.get(k) is not None
+        for k in ("totalRevenue", "trailingPE", "returnOnEquity", "marketCap")
+    )
+    has_statements = (
+        (cashflow is not None and not cashflow.empty)
+        or (financials is not None and not financials.empty)
+    )
+    return not has_info and not has_statements
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def _yz_fetch(symbol: str) -> Dict[str, object]:
     """Fetch all needed data for a ticker from Yahoo Finance. Cached 15 min."""
@@ -997,39 +1197,35 @@ def _yz_fetch(symbol: str) -> Dict[str, object]:
         return {"error": "Enter a ticker symbol"}
     try:
         ticker = yf.Ticker(symbol)
+        info: dict = {}
         try:
             info = ticker.info or {}
         except Exception:
             info = {}
-        price = (
-            info.get("currentPrice")
-            or info.get("regularMarketPrice")
-            or info.get("previousClose")
-        )
+        info = _yz_merge_fast_info(info, ticker)
+
         history = pd.DataFrame()
         try:
             history = ticker.history(period="5y", auto_adjust=True)
         except Exception:
             pass
+
+        cashflow = _yz_fetch_statement(ticker, "get_cash_flow", "cashflow")
+        financials = _yz_fetch_statement(ticker, "get_income_stmt", "financials")
+        balance = _yz_fetch_statement(ticker, "get_balance_sheet", "balance_sheet")
+        info = _yz_enrich_info_from_statements(info, financials, cashflow, balance)
+
+        price = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or info.get("previousClose")
+        )
         if (history is None or history.empty) and price is None:
             return {"error": f"No data found for '{symbol}'. Check the ticker symbol."}
         if history is None or history.empty:
             return {"error": f"No price history available for '{symbol}'."}
-        cashflow = pd.DataFrame()
-        try:
-            cashflow = ticker.cashflow
-        except Exception:
-            pass
-        financials = pd.DataFrame()
-        try:
-            financials = ticker.financials
-        except Exception:
-            pass
-        balance = pd.DataFrame()
-        try:
-            balance = ticker.balance_sheet
-        except Exception:
-            pass
+
+        partial = _yz_data_is_partial(info, cashflow, financials)
         return {
             "symbol": symbol,
             "info": info,
@@ -1037,6 +1233,7 @@ def _yz_fetch(symbol: str) -> Dict[str, object]:
             "cashflow": cashflow,
             "financials": financials,
             "balance": balance,
+            "partial": partial,
         }
     except Exception as exc:
         return {"error": f"Failed to fetch '{symbol}': {exc}"}
@@ -1130,12 +1327,17 @@ def _yz_dcf(cashflow: pd.DataFrame, info: dict) -> dict:
             break
     if not fcf_values:
         ocf = capex = None
-        for label in ["Operating Cash Flow", "Cash Flow From Operations",
-                      "Total Cash From Operating Activities"]:
+        for label in [
+            "Operating Cash Flow", "OperatingCashFlow", "Cash Flow From Operations",
+            "Cash Flow From Continuing Operating Activities",
+            "CashFlowFromContinuingOperatingActivities",
+        ]:
             if label in cashflow.index:
                 ocf = cashflow.loc[label]
                 break
-        for label in ["Capital Expenditure", "Capital Expenditures"]:
+        for label in [
+            "Capital Expenditure", "CapitalExpenditure", "Capital Expenditures",
+        ]:
             if label in cashflow.index:
                 capex = cashflow.loc[label]
                 break
@@ -1451,8 +1653,13 @@ def _yz_render_fundamentals(info: dict, cashflow: pd.DataFrame,
         rows_chart = []
         wanted = {
             "Total Revenue": "Revenue",
+            "TotalRevenue": "Revenue",
+            "Operating Revenue": "Revenue",
+            "OperatingRevenue": "Revenue",
             "Gross Profit": "Gross profit",
+            "GrossProfit": "Gross profit",
             "Net Income": "Net income",
+            "NetIncome": "Net income",
         }
         for src, label in wanted.items():
             if src in financials.index:
@@ -1836,8 +2043,12 @@ def analyzer_hero() -> None:
             "plan in one shot. Powered by live Yahoo Finance data."
         )
     with col_pill:
+        st.markdown("<div style='padding-top:18px;'>", unsafe_allow_html=True)
+        if st.button("Refresh price", key="yz_refresh_price_hero", use_container_width=True):
+            st.session_state.yz_refresh_requested = True
+            st.rerun()
         st.markdown(
-            "<div style='text-align:right; padding-top:24px;'>"
+            "<div style='text-align:right; padding-top:8px;'>"
             "<span style='background:#1d3a5f; color:#7ab8ff; padding:4px 10px; "
             "border-radius:12px; font-size:12px;'>LIVE YAHOO DATA</span></div>",
             unsafe_allow_html=True,
@@ -1848,6 +2059,9 @@ def analyzer_main() -> None:
     if not _YF_OK:
         st.error("`yfinance` is not installed. Run: `pip install yfinance`")
         return
+
+    if st.session_state.pop("yz_refresh_requested", False):
+        _yz_fetch.clear()
 
     if "yz_symbol" not in st.session_state:
         st.session_state.yz_symbol = "AAPL"
@@ -1874,6 +2088,17 @@ def analyzer_main() -> None:
             "Analyze", use_container_width=True, type="primary",
         )
 
+    col_spacer, col_refresh = st.columns([5, 1])
+    with col_refresh:
+        if st.button(
+            "Refresh price",
+            key="yz_refresh_price",
+            use_container_width=True,
+            help="Fetch latest Yahoo prices and fundamentals for the current ticker",
+        ):
+            st.session_state.yz_refresh_requested = True
+            st.rerun()
+
     if submitted:
         new_symbol = (symbol_input or "").strip().upper()
         if new_symbol:
@@ -1897,6 +2122,13 @@ def analyzer_main() -> None:
             "not `BRK.B`). Wait a minute if you've been rate-limited."
         )
         return
+
+    if data.get("partial"):
+        st.warning(
+            "Yahoo returned price data only — fundamentals and cash flow are "
+            "temporarily unavailable (often rate limits). Wait 1–2 minutes, then "
+            "click **Refresh** or try a major US ticker like `AAPL`."
+        )
 
     info = data["info"]
     history = data["history"]
@@ -4569,12 +4801,24 @@ if "active_topic" not in st.session_state:
 if "active_page" not in st.session_state:
     st.session_state.active_page = DEFAULT_PAGE
 
+# Guard: topic removed while session was still on it (e.g. Thai Fund Screener).
+if st.session_state.active_topic not in TOPICS:
+    st.session_state.active_topic = DEFAULT_TOPIC
+    st.session_state.active_page = DEFAULT_PAGE
+
 
 def navigate(topic_name: str, page_name: str) -> None:
     """Switch to a topic + page and re-run the script."""
     st.session_state.active_topic = topic_name
     st.session_state.active_page = page_name
     st.rerun()
+
+
+if st.session_state.pop("gold_refresh_requested", False):
+    _gold_fetch_live.clear()
+
+if st.session_state.active_topic == "Gold (XAU/USD)":
+    _gold_apply_market()
 
 
 with st.sidebar:
@@ -4600,9 +4844,9 @@ with st.sidebar:
     if st.session_state.active_topic == "Gold (XAU/USD)":
         st.divider()
         st.caption("Quick stats · Gold")
-        st.metric("Spot", f"${SPOT:,.2f}", f"{DAILY_CHANGE_PCT:+.2f}% · 24h")
-        st.metric("DXY", f"{DXY:.2f}", "99–99.5 range")
-        st.metric("10Y real yield", f"{TIPS_10Y:.2f}%", "+0.27 pts MTD")
+        st.metric("Spot", f"${SPOT:,.2f}", f"{DAILY_CHANGE_PCT:+.2f}% · live")
+        st.metric("DXY", f"{DXY:.2f}", "Live")
+        st.metric("10Y nominal", f"{NOMINAL_10Y:.2f}%", "Live")
         st.metric("CPI y/y (Apr)", f"{CPI_YOY:.1f}%", f"Core {CORE_CPI_YOY:.1f}%")
 
     st.divider()
